@@ -3,7 +3,10 @@ package com.github.highcumontoa.tenantrequestgovernancejava.access;
 import com.github.highcumontoa.tenantrequestgovernancejava.common.GovernanceException;
 import com.github.highcumontoa.tenantrequestgovernancejava.common.RejectReason;
 import com.github.highcumontoa.tenantrequestgovernancejava.common.RequestContext;
+import com.github.highcumontoa.tenantrequestgovernancejava.common.SnapshotException;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -27,7 +30,7 @@ public class AccessControlService {
 
     private static final Set<String> KNOWN_ROLES = Set.of(ROLE_READER, ROLE_WRITER, ROLE_ADMIN);
 
-    private final Map<String, Set<String>> tenantRoles = new ConcurrentHashMap<>();
+    private volatile Map<String, Set<String>> tenantRoles = new ConcurrentHashMap<>();
 
     public void registerTenant(String tenantId, Set<String> roles) {
         for (String role : roles) {
@@ -36,6 +39,16 @@ public class AccessControlService {
             }
         }
         tenantRoles.put(tenantId, Set.copyOf(roles));
+    }
+
+    /** 仅在租户尚未注册时注册；已注册（含快照恢复而来）的租户授权集合原样保留。 */
+    public void registerTenantIfAbsent(String tenantId, Set<String> roles) {
+        for (String role : roles) {
+            if (!KNOWN_ROLES.contains(role)) {
+                throw new IllegalArgumentException("unknown role: " + role);
+            }
+        }
+        tenantRoles.putIfAbsent(tenantId, Set.copyOf(roles));
     }
 
     public boolean isKnownTenant(String tenantId) {
@@ -68,5 +81,39 @@ public class AccessControlService {
 
     private boolean isWriteAction(String action) {
         return action.startsWith("CREATE") || action.startsWith("UPDATE") || action.startsWith("DELETE");
+    }
+
+    /** 快照用：租户注册信息（租户 -> 授权角色集合）。 */
+    public record TenantState(String tenantId, Set<String> roles) {
+    }
+
+    /** 导出全部租户注册信息。调用方需持有治理读/写锁。 */
+    public List<TenantState> exportState() {
+        List<TenantState> out = new ArrayList<>(tenantRoles.size());
+        tenantRoles.forEach((tenantId, roles) -> out.add(new TenantState(tenantId, Set.copyOf(roles))));
+        return out;
+    }
+
+    /**
+     * 用快照整体替换租户注册表（原子换表）。未知角色 / 空字段拒绝整次恢复。
+     * 调用方需持有治理写锁。
+     */
+    public void restoreState(List<TenantState> states) {
+        Map<String, Set<String>> rebuilt = new ConcurrentHashMap<>();
+        for (TenantState s : states) {
+            if (s.tenantId() == null || s.tenantId().isBlank()) {
+                throw new SnapshotException("snapshot tenant entry has blank tenantId");
+            }
+            if (s.roles() == null || s.roles().isEmpty()) {
+                throw new SnapshotException("snapshot tenant '" + s.tenantId() + "' has no roles");
+            }
+            for (String role : s.roles()) {
+                if (!KNOWN_ROLES.contains(role)) {
+                    throw new SnapshotException("snapshot tenant '" + s.tenantId() + "' carries unknown role: " + role);
+                }
+            }
+            rebuilt.put(s.tenantId(), Set.copyOf(s.roles()));
+        }
+        tenantRoles = rebuilt;
     }
 }

@@ -4,6 +4,7 @@ import com.github.highcumontoa.tenantrequestgovernancejava.audit.AuditEntry;
 import com.github.highcumontoa.tenantrequestgovernancejava.audit.AuditService;
 import com.github.highcumontoa.tenantrequestgovernancejava.common.GovernanceException;
 import com.github.highcumontoa.tenantrequestgovernancejava.common.RejectReason;
+import com.github.highcumontoa.tenantrequestgovernancejava.common.SnapshotException;
 import com.github.highcumontoa.tenantrequestgovernancejava.web.dto.ErrorResponse;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -31,6 +32,19 @@ public class GovernanceExceptionHandler {
 
     public GovernanceExceptionHandler(AuditService audit) {
         this.audit = audit;
+    }
+
+    /** 快照失败（版本不兼容 / 损坏 / 校验和不符 / 写盘失败）-> 400，明确拒绝且当前状态不变。 */
+    @ExceptionHandler(SnapshotException.class)
+    public ResponseEntity<ErrorResponse> handleSnapshot(SnapshotException ex,
+                                                        jakarta.servlet.http.HttpServletRequest request) {
+        ErrorResponse body = new ErrorResponse(
+                "SNAPSHOT_REJECTED",
+                "INVALID_SNAPSHOT",
+                ex.getMessage(),
+                null,
+                (String) request.getAttribute("governance.requestId"));
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
     }
 
     @ExceptionHandler(GovernanceException.class)
