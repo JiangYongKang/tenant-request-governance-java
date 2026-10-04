@@ -1,5 +1,11 @@
 package com.github.highcumontoa.tenantrequestgovernancejava.quota;
 
+import com.github.highcumontoa.tenantrequestgovernancejava.snapshot.SnapshotPayload;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
@@ -117,5 +123,39 @@ public class QuotaService {
     public long currentLimit(String tenantId, String action) {
         Window window = windows.get(new Key(tenantId, action));
         return window == null ? -1L : window.limit;
+    }
+
+    /**
+     * 导出全部已配置配额 (limit >= 0) 的窗口状态：上限、窗口起点、窗口内已用计数。
+     * 逐个窗口在其自身锁内读取，保证单个窗口三元组一致；跨窗口的整体一致性
+     * 由调用方（快照导出）持有的全局写锁保证。
+     */
+    public List<SnapshotPayload.QuotaEntry> exportState() {
+        List<SnapshotPayload.QuotaEntry> out = new ArrayList<>();
+        windows.forEach((key, window) -> {
+            synchronized (window) {
+                if (window.limit >= 0) {
+                    out.add(new SnapshotPayload.QuotaEntry(key.tenantId(), key.action(),
+                            window.limit, window.startMillis, window.count.get()));
+                }
+            }
+        });
+        return out;
+    }
+
+    /**
+     * 整体替换限流状态：先构造好全部新窗口，再一次换入，
+     * 调用方需持有全局写锁（恢复要么整体生效、要么不生效）。
+     * 恢复未过期窗口的已用计数；过期窗口在下次判定时按既有滚动逻辑自然归零。
+     */
+    public void importState(List<SnapshotPayload.QuotaEntry> entries) {
+        Map<Key, Window> restored = new HashMap<>();
+        for (SnapshotPayload.QuotaEntry e : entries) {
+            Window window = new Window(e.windowStartMillis(), e.limit());
+            window.count.set(e.usedCount());
+            restored.put(new Key(e.tenantId(), e.action()), window);
+        }
+        windows.clear();
+        windows.putAll(restored);
     }
 }

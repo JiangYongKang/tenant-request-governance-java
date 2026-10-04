@@ -30,18 +30,34 @@ public class GovernanceFacade {
     private final IdempotencyService idempotency;
     private final AuditService audit;
     private final OrderService orders;
+    private final GovernanceStateLock stateLock;
 
     public GovernanceFacade(AccessControlService accessControl, QuotaService quota,
                             IdempotencyService idempotency, AuditService audit, OrderService orders) {
+        this(accessControl, quota, idempotency, audit, orders, new GovernanceStateLock());
+    }
+
+    public GovernanceFacade(AccessControlService accessControl, QuotaService quota,
+                            IdempotencyService idempotency, AuditService audit, OrderService orders,
+                            GovernanceStateLock stateLock) {
         this.accessControl = accessControl;
         this.quota = quota;
         this.idempotency = idempotency;
         this.audit = audit;
         this.orders = orders;
+        this.stateLock = stateLock;
     }
 
-    /** 写操作：受访问控制 + 配额 + 幂等保护，全程审计。 */
+    /**
+     * 写操作：受访问控制 + 配额 + 幂等保护，全程审计。
+     * 整个判定-执行-留痕在全局读锁内进行：请求之间彼此并发，
+     * 快照导出/恢复（写锁）开始时不会有“执行到一半”的请求，保证快照是某一时刻的一致状态。
+     */
     public GovernanceResult<String> createOrder(RequestContext ctx, String idempotencyKey, String payload) {
+        return stateLock.withReadLock(() -> doCreateOrder(ctx, idempotencyKey, payload));
+    }
+
+    private GovernanceResult<String> doCreateOrder(RequestContext ctx, String idempotencyKey, String payload) {
         // 1) 访问控制：未注册租户 / 角色越权 / 跨租户 -> 审计后拒绝。
         try {
             accessControl.check(ctx, ACTION_CREATE_ORDER);

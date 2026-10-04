@@ -47,6 +47,21 @@ public class GovernanceExceptionHandler {
         return ResponseEntity.status(STATUS.getOrDefault(ex.getReason(), HttpStatus.INTERNAL_SERVER_ERROR)).body(body);
     }
 
+    /** 快照版本不兼容 / 内容损坏 / 校验失败：400，在线治理状态不受影响。 */
+    @ExceptionHandler(com.github.highcumontoa.tenantrequestgovernancejava.snapshot.SnapshotException.class)
+    public ResponseEntity<ErrorResponse> handleSnapshot(
+            com.github.highcumontoa.tenantrequestgovernancejava.snapshot.SnapshotException ex,
+            jakarta.servlet.http.HttpServletRequest request) {
+        String requestId = (String) request.getAttribute("governance.requestId");
+        ErrorResponse body = new ErrorResponse(
+                "SNAPSHOT_REJECTED",
+                "SNAPSHOT_INVALID",
+                ex.getMessage(),
+                null,
+                requestId);
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(body);
+    }
+
     private Long findAuditSeq(String requestId) {
         if (requestId == null) {
             return null;

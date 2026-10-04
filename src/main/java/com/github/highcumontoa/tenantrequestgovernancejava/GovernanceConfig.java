@@ -4,13 +4,15 @@ import com.github.highcumontoa.tenantrequestgovernancejava.access.AccessControlS
 import com.github.highcumontoa.tenantrequestgovernancejava.audit.AuditService;
 import com.github.highcumontoa.tenantrequestgovernancejava.business.OrderService;
 import com.github.highcumontoa.tenantrequestgovernancejava.governance.GovernanceFacade;
+import com.github.highcumontoa.tenantrequestgovernancejava.governance.GovernanceStateLock;
 import com.github.highcumontoa.tenantrequestgovernancejava.idempotency.IdempotencyService;
 import com.github.highcumontoa.tenantrequestgovernancejava.quota.QuotaService;
+import com.github.highcumontoa.tenantrequestgovernancejava.snapshot.SnapshotService;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 /**
- * 治理组件装配（内存实现）。
+ * 治理组件装配（内存实现 + 本地快照持久化）。
  */
 @Configuration
 public class GovernanceConfig {
@@ -41,11 +43,26 @@ public class GovernanceConfig {
     }
 
     @Bean
+    public GovernanceStateLock governanceStateLock() {
+        return new GovernanceStateLock();
+    }
+
+    @Bean
     public GovernanceFacade governanceFacade(AccessControlService accessControlService,
                                              QuotaService quotaService,
                                              IdempotencyService idempotencyService,
                                              AuditService auditService,
-                                             OrderService orderService) {
-        return new GovernanceFacade(accessControlService, quotaService, idempotencyService, auditService, orderService);
+                                             OrderService orderService,
+                                             GovernanceStateLock governanceStateLock) {
+        return new GovernanceFacade(accessControlService, quotaService, idempotencyService,
+                auditService, orderService, governanceStateLock);
+    }
+
+    @Bean
+    public SnapshotService snapshotService(QuotaService quotaService,
+                                           IdempotencyService idempotencyService,
+                                           AuditService auditService,
+                                           GovernanceStateLock governanceStateLock) {
+        return new SnapshotService(quotaService, idempotencyService, auditService, governanceStateLock);
     }
 }

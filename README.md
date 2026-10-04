@@ -1,19 +1,21 @@
 # 多租户请求治理服务（tenant-request-governance-java）
 
 基于 Spring Boot 3 / Java 21 的多租户请求治理能力演示。所有状态（配额、幂等、审计）
-均使用**本地内存**模拟，但在并发下提供一致且可解释的结论：
+均使用**本地内存**模拟，但在并发下提供一致且可解释的结论；同时支持把治理状态
+**整体导出为本地快照文件并在需要时接回**，重启或换环境后限流、幂等、审计接着走：
 
 - 按 **租户 + 操作** 维度的固定窗口配额限流，并发计数准确；
 - 写操作 **幂等提交**，重复提交返回首次结果，业务副作用只发生一次；
 - **租户 + 角色** 访问控制，越权 / 跨租户被拒绝且原因可区分；
-- 每个被接受或被拒绝的关键操作都留下**单调递增、只追加**的审计记录。
+- 每个被接受或被拒绝的关键操作都留下**单调递增、只追加**的审计记录；
+- 治理状态**快照导出 / 恢复**：并发安全、版本化、损坏即拒、恢复原子生效。
 
 ---
 
 ## 1. 快速开始
 
 ```bash
-# 构建 + 全部单测（17 个用例）
+# 构建 + 全部单测（24 个用例）
 mvn test
 
 # 启动服务
@@ -115,7 +117,61 @@ mvn spring-boot:run
 
 ---
 
-## 6. HTTP 接口
+## 6. 状态快照（导出 / 恢复）
+
+治理状态可以整体导出为一份本地快照文件，服务重启或运行期重新加载后**接着用**，
+而不是回到初始值。
+
+### 快照包含什么
+
+| 状态 | 内容 | 恢复后的行为 |
+|------|------|--------------|
+| 限流 | 每个 `(tenant, action)` 的配额上限、窗口起点、窗口内已用计数 | 未过期窗口的已用计数继续算进限流；过期窗口按既有滚动逻辑自然归零 |
+| 幂等 | 已生效的 `(tenant, idempotencyKey)` 首次提交结果（含请求摘要） | 同租户同键重复提交仍返回首次结果，业务副作用不再发生；同键不同内容仍报 `409 IDEMPOTENCY_CONFLICT` |
+| 审计 | 全部审计流水 + 已用最大序号 | 新记录从已有序号往后接着排，不重复、不回退、不错序 |
+
+### 并发与一致性语义
+
+- **导出**：全局写锁内只做一次纯内存拷贝（微秒级），序列化与落盘在锁外完成。
+  在线请求只被短暂阻塞，导出的内容是**某一时刻的一致状态**，不会拼出一半旧值一半新值
+  （见 `SnapshotPersistenceTest#concurrentExportYieldsConsistentSnapshot`：请求洪峰中导出的
+  每份快照，审计条数 / ACCEPT 数 / 幂等记录数 / 配额计数互相吻合）。
+- **恢复**：版本、校验和、结构、审计序号连续性、幂等结果可反序列化等**全部校验在加锁前完成**；
+  校验通过后才在写锁内一次性换入三类状态——**要么整体生效、要么整体不生效**，
+  不存在恢复了一半的中间态（见 `concurrentRestoreIsAtomicAndRequestsSeeOldOrNewNotMixed`）。
+- **落盘**：先写同目录临时文件再原子 rename，快照写到一半失败不会留下半个正式文件；
+  文件首行为元信息（版本 / 时间戳 / SHA-256 校验和），校验和覆盖载荷字节，截断或篡改必被发现。
+- **性能**：恢复后各类判定仍是 `ConcurrentHashMap` 的 O(1) 查找，
+  大快照（2 万条幂等记录）恢复后在线判定耗时不明显劣化
+  （见 `largeSnapshotRestoreKeepsDecisionsFast`）。
+
+### 版本兼容
+
+- 快照携带 `formatVersion`（当前为 **1**），只接受**完全一致**的版本号；
+  版本不符、校验和不匹配、内容损坏、结构非法一律抛出 `SnapshotException`
+  （HTTP 层映射为 `400 SNAPSHOT_INVALID`），**当前在线状态不被污染或覆盖**，
+  拒绝后服务按原状态继续限流 / 幂等 / 审计
+  （见 `corruptedTruncatedAndIncompatibleSnapshotsAreRejectedWithoutPollutingState`）。
+
+### 怎么用
+
+```bash
+# 导出（path 缺省为 ./governance-snapshot.json）
+curl -s -X POST http://localhost:8080/api/admin/snapshot/export \
+  -H 'Content-Type: application/json' -d '{"path":"/tmp/gov-snap.json"}'
+
+# 恢复（运行期整体换入；重启后调用同一接口即可接回）
+curl -s -X POST http://localhost:8080/api/admin/snapshot/restore \
+  -H 'Content-Type: application/json' -d '{"path":"/tmp/gov-snap.json"}'
+```
+
+失败处理：恢复被拒绝时响应体携带 `SNAPSHOT_INVALID` 与具体原因
+（版本不兼容 / 校验和不匹配 / 文件不可读等），在线状态保持原样，
+修正快照文件后重试即可；导出失败（如目录不可写）同样只报错、不影响在线状态。
+
+---
+
+## 7. HTTP 接口
 
 ### 创建订单（受治理写接口）
 
@@ -179,10 +235,14 @@ mvn -Dtest=QuotaBoundaryTest test            # 配额边界 / 隔离 / 热更新
 mvn -Dtest=AccessControlTest test            # 跨租户 / 角色越权
 mvn -Dtest=AuditOrderingTest test            # 审计单调递增
 mvn -Dtest=HttpGovernanceIntegrationTest test # HTTP 端到端 + 状态码
+mvn -Dtest=SnapshotPersistenceTest test      # 快照导出/恢复/并发一致性/拒绝损坏快照
+mvn -Dtest=HttpSnapshotIntegrationTest test  # 快照 HTTP 端点端到端
 ```
 
 测试使用可控时钟（`QuotaService(windowMillis, clock)`）保证限流结果**稳定可复现**，
 不依赖真实时间流逝；并发用例通过 `CountDownLatch` 统一发令、断言精确数量，结果确定。
+快照用例额外覆盖：并发导出时快照内部三类状态互相吻合、并发恢复时请求只见完整旧态或完整新态、
+损坏/截断/版本不符的快照被拒绝且在线状态分毫未动、大快照恢复后判定耗时不劣化。
 
 单测日志会打印**请求标识、判定依据与审计序号**，例如：
 
@@ -190,7 +250,9 @@ mvn -Dtest=HttpGovernanceIntegrationTest test # HTTP 端到端 + 状态码
 [req-concurrent-7] decision=ACCEPT auditSeq=1 basis=quota ok (1/10000), order created
 [req-concurrent-8] decision=REPLAY auditSeq=2 basis=idempotent replay of key key-hot (quota not consumed)
 [req-bound-over] rejected reason=QUOTA_EXCEEDED basis=quota exhausted ... auditSeq=4
+[snapshot] snap-2.json consistent: entries=217 accepts=217
+[snapshot] corrupted rejected: corrupted snapshot: checksum mismatch
 ```
 
-> 说明：当前实现为**单进程内存态**，重启后状态丢失，仅用于演示与本地验证；
+> 说明：运行态仍是**单进程内存实现**，但治理状态可通过快照导出/恢复在重启间接续；
 > 生产环境应将配额、幂等记录、审计替换为 Redis / 数据库等共享存储，治理判定顺序与原因枚举可直接复用。
