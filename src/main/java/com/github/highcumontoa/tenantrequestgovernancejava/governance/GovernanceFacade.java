@@ -7,7 +7,7 @@ import com.github.highcumontoa.tenantrequestgovernancejava.business.OrderService
 import com.github.highcumontoa.tenantrequestgovernancejava.common.GovernanceException;
 import com.github.highcumontoa.tenantrequestgovernancejava.common.RejectReason;
 import com.github.highcumontoa.tenantrequestgovernancejava.common.RequestContext;
-import com.github.highcumontoa.tenantrequestgovernancejava.idempotency.IdempotentResult;
+import com.github.highcumontoa.tenantrequestgovernancejava.idempotency.Admission;
 import com.github.highcumontoa.tenantrequestgovernancejava.idempotency.IdempotencyService;
 import com.github.highcumontoa.tenantrequestgovernancejava.quota.QuotaService;
 
@@ -66,7 +66,36 @@ public class GovernanceFacade {
             throw ex;
         }
 
-        // 2) 配额限流：超限 -> 审计后拒绝，原因可区分且携带已用/上限。
+        String resourceTenant = ctx.resourceTenantId() == null ? ctx.tenantId() : ctx.resourceTenantId();
+        String requestHash = sha256(payload);
+
+        // 2) 幂等占位判定（不消耗任何配额）：
+        //    重放（含窗口已打满、快照接回之后）在此直接拿到首次结果；
+        //    同键不同内容在此直接冲突拒绝；只有抢到首位的请求才继续往下占配额。
+        Admission admission;
+        try {
+            admission = idempotency.admit(ctx.tenantId(), idempotencyKey, requestHash);
+        } catch (GovernanceException ex) {
+            // 幂等冲突：请求未被真正处理，也从未触碰配额；拒绝也必须留痕。
+            auditReject(ctx, ex);
+            throw ex;
+        }
+
+        if (admission instanceof Admission.Completed completed) {
+            return replayResult(ctx, idempotencyKey, completed.value());
+        }
+        if (admission instanceof Admission.InFlight inFlight) {
+            try {
+                return replayResult(ctx, idempotencyKey, IdempotencyService.awaitResult(inFlight.future()));
+            } catch (GovernanceException ex) {
+                // 合流到的首次提交失败（如首位撞上限流）：按首次提交的同一原因拒绝并留痕。
+                auditReject(ctx, ex);
+                throw ex;
+            }
+        }
+
+        // 3) 只有首次提交（leader）才占用窗口配额：超限拒绝并放开占位，允许后续同键重试。
+        Admission.Leader leader = (Admission.Leader) admission;
         QuotaService.AcquireOutcome outcome = quota.tryAcquire(ctx.tenantId(), ACTION_CREATE_ORDER);
         if (!outcome.allowed()) {
             String detail;
@@ -77,38 +106,34 @@ public class GovernanceFacade {
                         + " (used " + outcome.used() + "/" + outcome.limit() + " in window)";
             }
             GovernanceException ex = new GovernanceException(RejectReason.QUOTA_EXCEEDED, detail);
+            idempotency.failed(leader, ex);
             auditReject(ctx, ex);
             throw ex;
         }
 
-        String resourceTenant = ctx.resourceTenantId() == null ? ctx.tenantId() : ctx.resourceTenantId();
-        String requestHash = sha256(payload);
+        // 4) 执行业务（副作用仅此一处、恰好一次），随后固化首次结果唤醒合流等待者。
+        String orderId;
         try {
-            // 3) 幂等执行：副作用仅在首次提交发生一次；并发重复提交合流。
-            IdempotentResult<String> result = idempotency.execute(
-                    ctx.tenantId(), idempotencyKey, requestHash,
-                    () -> orders.createOrder(resourceTenant, payload));
-
-            // 重放（重复提交）不重复消耗业务配额：回退本次预占，仅首次提交计数。
-            if (result.replayed()) {
-                quota.release(ctx.tenantId(), ACTION_CREATE_ORDER);
-            }
-            AuditEntry entry = audit.record(
-                    ctx.requestId(), ctx.tenantId(), ACTION_CREATE_ORDER,
-                    result.replayed() ? "REPLAY" : "ACCEPT",
-                    result.replayed()
-                            ? "idempotent replay of key " + idempotencyKey + " (quota not consumed)"
-                            : "quota ok (" + outcome.used() + "/" + outcome.limit()
-                                    + "), order created");
-            return new GovernanceResult<>(result.value(), result.replayed(), entry.seq());
-        } catch (GovernanceException ex) {
-            // 幂等冲突：请求未被真正处理，回退预占配额；拒绝也必须留痕。
-            if (ex.getReason() == RejectReason.IDEMPOTENCY_CONFLICT) {
-                quota.release(ctx.tenantId(), ACTION_CREATE_ORDER);
-            }
-            auditReject(ctx, ex);
+            orderId = orders.createOrder(resourceTenant, payload);
+        } catch (RuntimeException | Error ex) {
+            // 业务未成功：回退预占配额、放开占位，允许后续用相同键重试。
+            quota.release(ctx.tenantId(), ACTION_CREATE_ORDER);
+            idempotency.failed(leader, ex);
             throw ex;
         }
+        idempotency.succeeded(leader, orderId);
+        AuditEntry entry = audit.record(
+                ctx.requestId(), ctx.tenantId(), ACTION_CREATE_ORDER, "ACCEPT",
+                "quota ok (" + outcome.used() + "/" + outcome.limit() + "), order created");
+        return new GovernanceResult<>(orderId, false, entry.seq());
+    }
+
+    /** 重放统一收尾：原样返回首次结果，不占配额、不产生副作用，仅追加 REPLAY 审计。 */
+    private GovernanceResult<String> replayResult(RequestContext ctx, String idempotencyKey, Object value) {
+        AuditEntry entry = audit.record(
+                ctx.requestId(), ctx.tenantId(), ACTION_CREATE_ORDER, "REPLAY",
+                "idempotent replay of key " + idempotencyKey + " (quota not consumed)");
+        return new GovernanceResult<>((String) value, true, entry.seq());
     }
 
     private void auditReject(RequestContext ctx, GovernanceException ex) {

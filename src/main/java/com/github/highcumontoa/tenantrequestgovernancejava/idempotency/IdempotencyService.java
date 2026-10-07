@@ -10,7 +10,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -32,9 +31,14 @@ public class IdempotencyService {
 
     private final ConcurrentHashMap<String, Slot> slots = new ConcurrentHashMap<>();
 
-    @SuppressWarnings("unchecked")
-    public <T> IdempotentResult<T> execute(String tenantId, String idempotencyKey,
-                                           String requestHash, Callable<T> producer) {
+    /**
+     * 原子地完成“判占位 + 放占位”，<b>不触碰限流配额</b>。
+     * 因此窗口打满后，重放仍能拿到 {@link Admission.Completed} / {@link Admission.InFlight}，
+     * 不会被配额挡住；只有抢到 {@link Admission.Leader} 的首个请求才继续去占配额。
+     * <p>同键不同内容（requestHash 不一致）立即抛
+     * {@link RejectReason#IDEMPOTENCY_CONFLICT}，无论该键是已完成还是处理中。
+     */
+    public Admission admit(String tenantId, String idempotencyKey, String requestHash) {
         if (idempotencyKey == null || idempotencyKey.isBlank()) {
             throw new IllegalArgumentException("idempotencyKey is required for write operations");
         }
@@ -42,48 +46,59 @@ public class IdempotencyService {
         CompletableFuture<Object> myFuture = new CompletableFuture<>();
 
         // compute 对单个 key 加锁，保证“判占位 + 放入占位”原子完成。
-        Slot[] decided = new Slot[1];
-        boolean[] first = new boolean[1];
+        Admission[] decision = new Admission[1];
         slots.compute(compositeKey, (k, existing) -> {
             if (existing == null) {
-                first[0] = true;
                 Slot created = new Slot(requestHash, myFuture);
-                decided[0] = created;
+                decision[0] = new Admission.Leader(compositeKey);
                 return created;
             }
-            decided[0] = existing;
+            if (!existing.requestHash().equals(requestHash)) {
+                throw new GovernanceException(RejectReason.IDEMPOTENCY_CONFLICT,
+                        "idempotency key '" + idempotencyKey
+                                + "' was first submitted with a different request body");
+            }
+            if (existing.future().isDone() && !existing.future().isCompletedExceptionally()
+                    && !existing.future().isCancelled()) {
+                decision[0] = new Admission.Completed(existing.future().join());
+            } else {
+                decision[0] = new Admission.InFlight(existing.future());
+            }
             return existing;
         });
+        return decision[0];
+    }
 
-        if (first[0]) {
-            try {
-                T value = producer.call();
-                myFuture.complete(value);
-                return new IdempotentResult<>(value, false);
-            } catch (RuntimeException | Error ex) {
-                myFuture.completeExceptionally(ex);
-                slots.remove(compositeKey, decided[0]);
-                throw ex;
-            } catch (Exception ex) {
-                myFuture.completeExceptionally(ex);
-                slots.remove(compositeKey, decided[0]);
-                throw new GovernanceException(RejectReason.IDEMPOTENCY_CONFLICT,
-                        "business execution failed: " + ex.getMessage());
-            }
-        }
+    /** Leader 业务成功：固化首次结果，唤醒所有合流等待的重放。 */
+    public void succeeded(Admission.Leader leader, Object value) {
+        slots.computeIfPresent(leader.compositeKey(), (k, slot) -> {
+            slot.future().complete(value);
+            return slot;
+        });
+    }
 
-        // 重复提交：先比对内容，再决定拒绝或返回首次结果。
-        Slot existing = decided[0];
-        if (!existing.requestHash().equals(requestHash)) {
-            throw new GovernanceException(RejectReason.IDEMPOTENCY_CONFLICT,
-                    "idempotency key '" + idempotencyKey + "' was first submitted with a different request body");
-        }
+    /** Leader 业务失败：异常完成占位并移除，唤醒等待者，允许后续同键重试。 */
+    public void failed(Admission.Leader leader, Throwable error) {
+        slots.computeIfPresent(leader.compositeKey(), (k, slot) -> {
+            slot.future().completeExceptionally(error);
+            return null;
+        });
+    }
+
+    /**
+     * 重放方等待并取出首次结果（{@link Admission.Completed} 的已完成结果，
+     * 或 {@link Admission.InFlight} 合流等待）。首次执行失败时原样透传其失败原因。
+     */
+    public static Object awaitResult(CompletableFuture<Object> future) {
         try {
-            return new IdempotentResult<>((T) existing.future().join(), true);
+            return future.join();
         } catch (java.util.concurrent.CompletionException ce) {
             Throwable cause = ce.getCause();
             if (cause instanceof RuntimeException re) {
                 throw re;
+            }
+            if (cause instanceof Error err) {
+                throw err;
             }
             throw new GovernanceException(RejectReason.IDEMPOTENCY_CONFLICT,
                     "first attempt failed: " + (cause == null ? "unknown" : cause.getMessage()));

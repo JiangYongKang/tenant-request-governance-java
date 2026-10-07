@@ -15,7 +15,7 @@
 ## 1. 快速开始
 
 ```bash
-# 构建 + 全部单测（24 个用例）
+# 构建 + 全部单测（29 个用例）
 mvn test
 
 # 启动服务
@@ -52,8 +52,13 @@ mvn spring-boot:run
 - **窗口滚动**：窗口过期后计数归零重新计数。
 - **运行期热更新**：`POST /api/admin/quota` 只修改上限，**不清空、不重置当前窗口与已有计数**；
   立即生效，且不与其它租户/操作串用（见 `quotaHotUpdateTakesEffectImmediatelyAndPreservesCount`）。
-- **配额与幂等的关系**：只有真正“首次执行业务”的请求才消耗配额；
-  幂等重放与内容冲突在判定后会**回退预占**，不会因重复提交耗尽窗口。
+- **配额与幂等的关系**：只有真正“首次执行业务”的请求才消耗配额。判定顺序为
+  **访问控制 → 幂等占位判定（不碰配额）→ 仅首次提交占配额 → 执行业务**：
+  - 幂等重放（无论窗口是否还有余量、是否已经打满、状态是否来自快照接回）直接返回首次结果，
+    **不占、不退、不等待配额**，连续重放也不会改动窗口已用计数；
+  - 同键不同内容的冲突在占配额之前就以 `409` 拒绝，不算放行、不占计数；
+  - 首次提交撞上限流才返回 `429` 并放开幂等占位，窗口滚动或配额恢复后同一键仍可重新首次提交。
+  见 `IdempotencyReplayQuotaTest`（窗口打满重放 / 快照接回后重放 / 与首次提交并发 / 同键冲突）。
 
 ### 拒绝响应示例（429）
 
@@ -72,15 +77,26 @@ mvn spring-boot:run
 ## 3. 幂等语义
 
 - **键维度**：`tenantId + idempotencyKey`。幂等键只在同一租户内去重，不同租户互不影响。
-- **首次提交**：执行业务，产生一次真实副作用（`OrderService` 内部计数 +1），返回结果并缓存。
+- **首次提交**：原子抢到该键的首位（leader）后才去占窗口配额并执行业务，
+  产生一次真实副作用（`OrderService` 内部计数 +1），结果固化后唤醒所有等待者。
 - **重复提交（相同内容）**：返回**首次结果**，`replayed=true`，业务副作用**不再次发生**。
+  幂等判定发生在配额占用**之前**，因此：
+  - **窗口打满后重放**：仍原样返回首次订单结果，不会被 `429 QUOTA_EXCEEDED` 挡住；
+  - **不占配额**：无论连续重放多少次，窗口已用计数既不多算也不少算（不需要“先占再退”）；
+  - **与首次提交并发**：后到线程合流等待进行中的首次提交，完成后稳定拿到同一个首次结果；
+  - **快照接回后重放**：接回的首次结果以“已完成”形态放回，重启 / 运行期恢复后上述行为完全一致。
 - **同键不同内容**：对请求体做 SHA-256 摘要比对，不一致立即返回
   `409 IDEMPOTENCY_CONFLICT`，明确拒绝（区别于正常重放）。
+  冲突判定同样先于配额：**窗口打满、快照接回之后，同键不同内容仍是 409**，
+  不会被当成重放返回旧结果，也不会算作一次放行。
 - **并发重复提交**：使用 `ConcurrentHashMap.compute` 原子地“判占位 + 放占位”，
   后到线程通过 `CompletableFuture` **合流等待**首个请求，因此任意并发度下副作用恰好一次
   （见 `IdempotencyConcurrencyTest#concurrentDuplicatesProduceSingleSideEffect`：
-  32 并发、同一幂等键，唯一订单数 = 1、副作用次数 = 1、其余全部 REPLAY）。
-- 首次执行业务失败时移除占位，允许后续用相同键重试。
+  32 并发、同一幂等键，唯一订单数 = 1、副作用次数 = 1、其余全部 REPLAY；
+  首次提交“进行中”时刻的合流见
+  `IdempotencyReplayQuotaTest#concurrentReplayJoinsInFlightFirstSubmission`）。
+- 首次提交在占配额前无需回滚；占配额后业务失败或超限被拒时会回退预占并移除占位，
+  允许后续用相同键重试（见 `IdempotencyReplayQuotaTest#rejectedFirstSubmissionReleasesSlotAndCanRetry`）。
 
 ---
 
@@ -127,7 +143,7 @@ mvn spring-boot:run
 | 状态 | 内容 | 恢复后的行为 |
 |------|------|--------------|
 | 限流 | 每个 `(tenant, action)` 的配额上限、窗口起点、窗口内已用计数 | 未过期窗口的已用计数继续算进限流；过期窗口按既有滚动逻辑自然归零 |
-| 幂等 | 已生效的 `(tenant, idempotencyKey)` 首次提交结果（含请求摘要） | 同租户同键重复提交仍返回首次结果，业务副作用不再发生；同键不同内容仍报 `409 IDEMPOTENCY_CONFLICT` |
+| 幂等 | 已生效的 `(tenant, idempotencyKey)` 首次提交结果（含请求摘要） | 同租户同键重复提交仍返回首次结果，业务副作用不再发生；即使恢复后窗口已打满，重放也不被限流挡住、不占计数；同键不同内容仍报 `409 IDEMPOTENCY_CONFLICT` |
 | 审计 | 全部审计流水 + 已用最大序号 | 新记录从已有序号往后接着排，不重复、不回退、不错序 |
 
 ### 并发与一致性语义
@@ -191,6 +207,10 @@ curl -s -X POST http://localhost:8080/api/orders \
 再次用**相同 body + 相同幂等键**调用：`replayed=true`，`orderId` 不变，副作用不重复。
 将 `payload` 改为不同内容：返回 `409 IDEMPOTENCY_CONFLICT`。
 
+> 窗口打满后（tenant-a 配额 3，已成功 3 笔），用已生效幂等键重放仍返回
+> `replayed=true` 的首次订单，而不是 `429`；换新幂等键的首次提交才返回 `429`。
+> 先 `POST /api/admin/snapshot/export` 导出、重启后 `restore` 接回，结论相同。
+
 ### 运行期调整配额（立即生效，保留计数）
 
 ```bash
@@ -231,12 +251,16 @@ mvn test
 
 # 只跑某一类场景
 mvn -Dtest=IdempotencyConcurrencyTest test   # 并发重复提交 / 冲突
+mvn -Dtest=IdempotencyReplayQuotaTest test   # 窗口打满/快照接回后重放、重放并发合流、同键冲突
 mvn -Dtest=QuotaBoundaryTest test            # 配额边界 / 隔离 / 热更新 / 窗口滚动
 mvn -Dtest=AccessControlTest test            # 跨租户 / 角色越权
 mvn -Dtest=AuditOrderingTest test            # 审计单调递增
 mvn -Dtest=HttpGovernanceIntegrationTest test # HTTP 端到端 + 状态码
 mvn -Dtest=SnapshotPersistenceTest test      # 快照导出/恢复/并发一致性/拒绝损坏快照
 mvn -Dtest=HttpSnapshotIntegrationTest test  # 快照 HTTP 端点端到端
+
+# 反复执行验证并发用例稳定（结果一致、无偶发失败）
+for i in $(seq 1 20); do mvn -Dtest=IdempotencyReplayQuotaTest test | grep 'Tests run:'; done
 ```
 
 测试使用可控时钟（`QuotaService(windowMillis, clock)`）保证限流结果**稳定可复现**，
@@ -250,6 +274,9 @@ mvn -Dtest=HttpSnapshotIntegrationTest test  # 快照 HTTP 端点端到端
 [req-concurrent-7] decision=ACCEPT auditSeq=1 basis=quota ok (1/10000), order created
 [req-concurrent-8] decision=REPLAY auditSeq=2 basis=idempotent replay of key key-hot (quota not consumed)
 [req-bound-over] rejected reason=QUOTA_EXCEEDED basis=quota exhausted ... auditSeq=4
+[req-replay-0] decision=REPLAY auditSeq=5 basis=idempotent replay of key key-original (quota not consumed) windowUsed=3
+[req-full-over] decision=REJECT reason=QUOTA_EXCEEDED auditSeq=6 basis=quota exhausted ... (used 3/3 in window) windowUsed=3
+[req-cf-diff] decision=REJECT reason=IDEMPOTENCY_CONFLICT auditSeq=3 basis=...different request body windowUsed=2
 [snapshot] snap-2.json consistent: entries=217 accepts=217
 [snapshot] corrupted rejected: corrupted snapshot: checksum mismatch
 ```
